@@ -166,8 +166,15 @@ class AddonApi implements LosslessSource {
 
   // -- search ---------------------------------------------------------------------
 
+  /// Searches one addon base. [quality] is the tier's primary knob
+  /// (`hi_res` for 27/7, `lossless` for 6, `high` for 5 — Android
+  /// parity: `LosslessMusicApi` searches with the tier, not hardcoded
+  /// `lossless`). The server filters by it, so a hardcoded value hides
+  /// entries tagged only for other tiers (e.g. a hi_res-only original
+  /// invisible at the default tier 27). Tier fallback still happens at
+  /// fetch time via [serverQualitiesForTier].
   Future<List<AddonTrack>> searchTracks(String query,
-      {int limit = 15}) async {
+      {int limit = 15, String quality = 'lossless'}) async {
     for (final root in bases) {
       try {
         final path = '${Uri.parse(root).path}search';
@@ -175,7 +182,7 @@ class AddonApi implements LosslessSource {
           '${root}search',
           queryParameters: {
             'q': query,
-            'quality': 'lossless',
+            'quality': quality,
             'atmos': 'none',
           },
           options: Options(headers: _signHeaders('GET', root, path)),
@@ -207,33 +214,290 @@ class AddonApi implements LosslessSource {
     return v.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
-  /// Verified match: title dice ≥ 90, artist token-compatible, duration
-  /// within 8s when both known. Strict — a wrong track is worse than
-  /// falling through to YouTube.
+  /// Bracketed feature clause, e.g. "Dracula (feat. JENNIE)" / "[ft. X]" /
+  /// "(with JENNIE)". Bracketed "with" is near-always a feature credit
+  /// (unlike a bare trailing "with", which would eat titles like
+  /// "Dance With Somebody"). Mirrors InnerTube `_featuringClause`
+  /// (comparison only, never queries).
+  static final RegExp _featClause = RegExp(
+      r'[\(\[]\s*(feat(?:uring)?|ft|with)\.?\s+[^\)\]]*[\)\]]',
+      caseSensitive: false);
+
+  /// Bracketed version noise, e.g. "(Explicit)" / "[Remastered 2011]".
+  /// Mirrors InnerTube `_versionClause`.
+  static final RegExp _versionClause = RegExp(
+      r'[\(\[][^\)\]]*(live|remix|acoustic|demo|edit|remaster(?:ed)?|mono|stereo|explicit|clean|slowed|sped up|nightcore)[^\)\]]*[\)\]]',
+      caseSensitive: false);
+
+  /// Bare trailing version tags without brackets ("Starboy Explicit",
+  /// "Song Single Version", "Track - Radio Edit"). Anchored at the end
+  /// so "Live Forever" keeps its leading "live".
+  static final RegExp _trailingVersion = RegExp(
+      r'\s+(?:-\s+)?(?:explicit|clean|single version|single|radio edit|radio|edit|live|acoustic|demo|remaster(?:ed)?(?: \d{4})?|mono|stereo|slowed|sped up|nightcore)\s*$',
+      caseSensitive: false);
+
+  /// Bare trailing "feat. X" without brackets ("Dracula feat JENNIE").
+  static final RegExp _trailingFeat = RegExp(
+      r'\s+(?:feat(?:uring)?|ft)\.?\s+.+$',
+      caseSensitive: false);
+
+  /// Raw feature-credit substring from a title ("JENNIE" from both
+  /// "Dracula (feat. JENNIE)" and "Dracula feat JENNIE"), cleaned.
+  /// Empty when the title carries no feature credit.
+  static String _featPart(String title) {
+    final m1 = _featClause.firstMatch(title);
+    if (m1 != null) {
+      var inner = m1.group(0)!;
+      inner = inner.replaceAll(RegExp(r'^[\(\[]\s*'), '');
+      inner = inner.replaceAll(RegExp(r'[\)\]]\s*$'), '');
+      inner = inner.replaceAll(
+          RegExp(r'^(?:feat(?:uring)?|ft|with)\.?\s+',
+              caseSensitive: false),
+          '');
+      return _clean(inner);
+    }
+    final m2 = _trailingFeat.firstMatch(title);
+    if (m2 != null) {
+      var tail = m2.group(0)!;
+      tail = tail.replaceAll(
+          RegExp(r'^\s+(?:feat(?:uring)?|ft)\.?\s+',
+              caseSensitive: false),
+          '');
+      return _clean(tail);
+    }
+    return '';
+  }
+
+  /// Feature fidelity bonus: distinguishes the remix from the original
+  /// when stripping equates them ("dracula" == "dracula (feat jennie)").
+  /// Wanted-feat must match candidate-feat; otherwise the player serves
+  /// the original when the user queued the remix (or vice versa).
+  /// A *different* featured artist ranks lowest: it is a different
+  /// recording, while the base song is the more faithful fallback.
+  static int _featBonus(String candidateTitle, String wantedTitle) {
+    final c = _featPart(candidateTitle);
+    final w = _featPart(wantedTitle);
+    if (w.isEmpty && c.isEmpty) return 2;
+    if (w.isNotEmpty && c.isNotEmpty) {
+      if (c == w) return 3;
+      final ct = c.split(' ').toSet();
+      final wt = w.split(' ').toSet();
+      if (ct.intersection(wt).isNotEmpty) return 1;
+      return -3; // different featured artists (1nonly vs JENNIE)
+    }
+    if (w.isNotEmpty) return -2; // wanted remix, got original
+    return -1; // wanted original, got remix
+  }
+  /// Comparison-only stripped title: "Dracula (feat. JENNIE)" → "dracula",
+  /// "Starboy [Explicit]" → "starboy". Queries still use [_clean].
+  static String _strippedTitle(String s) {
+    var v = s.replaceAll(_featClause, ' ');
+    v = v.replaceAll(_versionClause, ' ');
+    v = v.replaceAll(_trailingFeat, ' ');
+    var prev = '';
+    v = _clean(v);
+    // Repeat trailing-version strip: "Song Single Version Explicit".
+    while (v != prev) {
+      prev = v;
+      v = _clean(v.replaceAll(_trailingVersion, ' '));
+    }
+    return v;
+  }
+
+  /// First billed artist for collab billing ("A; B; C" → "A",
+  /// "Tame Impala feat. JENNIE" → "Tame Impala"). Mirrors InnerTube
+  /// `primaryArtistForMatch` so the addon tier retries like playback.
+  static String primaryArtistForMatch(String artist) {
+    var s = artist.split(';').first.trim();
+    if (s.isEmpty) return '';
+    s = s
+        .split(RegExp(
+          r'\s+[(\[]?(?:feat\.?|ft\.?|featuring)\b',
+          caseSensitive: false,
+        ))
+        .first
+        .trim();
+    if (s.isEmpty) return '';
+    if (RegExp(r',\s*(the|and)\b', caseSensitive: false).hasMatch(s) &&
+        !s.contains(' & ')) {
+      return s;
+    }
+    final lower = s.toLowerCase();
+    if (lower == 'unknown artist' ||
+        lower == 'various artists' ||
+        lower == 'unknown') {
+      return '';
+    }
+    return s.split(RegExp(r'\s*[,&]\s*')).first.trim();
+  }
+
+  /// Verified match: title dice ≥ 90 on raw OR stripped comparison
+  /// (stripped-exact always passes), artist token-compatible (with
+  /// primary-artist retry + title feature-credit fallback), duration
+  /// within 8s when both known. Ranking is (title, feat fidelity, raw,
+  /// album): the JENNIE remix beats the original when the queue asked
+  /// for the remix, and vice versa. Strict — a wrong track is worse
+  /// than falling through to YouTube — but feat/version noise no
+  /// longer counts as a different song.
   static AddonTrack? bestMatch(
     List<AddonTrack> candidates, {
     required String title,
     required String artist,
     int expectedDurationSeconds = 0,
+    String album = '',
   }) {
-    AddonTrack? best;
-    var bestScore = -1;
+    final ranked = bestMatches(
+      candidates,
+      title: title,
+      artist: artist,
+      expectedDurationSeconds: expectedDurationSeconds,
+      album: album,
+    );
+    return ranked.isEmpty ? null : ranked.first;
+  }
+
+  /// All passing candidates, best first under the same ranking.
+  /// The resolver walks this list so a server-side stream failure
+  /// (HTTP 502 minting one entry, as seen on a `swap_`-prefixed
+  /// Starboy composite) falls through to the next-best version
+  /// instead of dropping to YouTube.
+  static List<AddonTrack> bestMatches(
+    List<AddonTrack> candidates, {
+    required String title,
+    required String artist,
+    int expectedDurationSeconds = 0,
+    String album = '',
+  }) {
+    final scored = <({AddonTrack track, int title, int feat, int raw, int album})>[];
+    final wantStripped = _strippedTitle(title);
+    final wantAlbum = _clean(album);
     for (final c in candidates) {
-      final titleScore =
-          dice(_clean(c.title), _clean(title));
-      if (titleScore < 90) continue;
-      if (!_artistOk(c.artist, artist)) continue;
+      final rawScore = dice(_clean(c.title), _clean(title));
+      final candStripped = _strippedTitle(c.title);
+      final s1 = dice(_clean(c.title), wantStripped);
+      final s2 = dice(candStripped, wantStripped);
+      final strippedScore = s1 > s2 ? s1 : s2;
+      // Exact-after-strip ("dracula" == "dracula (feat jennie)")
+      // passes even though raw dice is ~50 on short bases.
+      final strippedExact = _strippedTitle(c.title) == wantStripped &&
+          wantStripped.isNotEmpty;
+      final titleScore = rawScore > strippedScore ? rawScore : strippedScore;
+      if (!strippedExact && titleScore < 90) continue;
+      if (!_artistOkFeatAware(
+        cTitle: c.title,
+        cArtist: c.artist,
+        wantTitle: title,
+        wantArtist: artist,
+      )) {
+        continue;
+      }
       if (expectedDurationSeconds > 0 && c.durationSeconds > 0) {
         if ((c.durationSeconds - expectedDurationSeconds).abs() > 8) {
           continue;
         }
       }
-      if (titleScore > bestScore) {
-        bestScore = titleScore;
-        best = c;
+      final feat = _featBonus(c.title, title);
+      var albumBonus = 0;
+      if (wantAlbum.isNotEmpty && c.album.isNotEmpty) {
+        final cal = _clean(c.album);
+        if (cal == wantAlbum) {
+          albumBonus = 2;
+        } else if (cal.contains(wantAlbum) || wantAlbum.contains(cal)) {
+          albumBonus = 1;
+        }
       }
+      scored.add(
+          (track: c, title: titleScore, feat: feat, raw: rawScore, album: albumBonus));
     }
-    return best;
+    scored.sort((a, b) {
+      if (a.title != b.title) return b.title.compareTo(a.title);
+      if (a.feat != b.feat) return b.feat.compareTo(a.feat);
+      if (a.raw != b.raw) return b.raw.compareTo(a.raw);
+      return b.album.compareTo(a.album);
+    });
+    if (kDebugMode && scored.isEmpty && candidates.isNotEmpty) {
+      // Show why the gate rejected everything: top-3 by raw score
+      // with candidate artist/album/duration and the reject stage.
+      final byRaw = candidates
+          .map((c) => MapEntry(
+              c, dice(_clean(c.title), _clean(title))))
+          .toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      final top = byRaw.take(3).map((e) {
+        final c = e.key;
+        final rawScore = dice(_clean(c.title), _clean(title));
+        final candStripped = _strippedTitle(c.title);
+        final s1 = dice(_clean(c.title), wantStripped);
+        final s2 = dice(candStripped, wantStripped);
+        final strippedScore = s1 > s2 ? s1 : s2;
+        final strippedExact = candStripped == wantStripped &&
+            wantStripped.isNotEmpty;
+        final titleScore =
+            rawScore > strippedScore ? rawScore : strippedScore;
+        String reason;
+        if (!strippedExact && titleScore < 90) {
+          reason = 'title';
+        } else if (!_artistOkFeatAware(
+            cTitle: c.title,
+            cArtist: c.artist,
+            wantTitle: title,
+            wantArtist: artist)) {
+          reason = 'artist';
+        } else if (expectedDurationSeconds > 0 &&
+            c.durationSeconds > 0 &&
+            (c.durationSeconds - expectedDurationSeconds).abs() > 8) {
+          reason = 'duration';
+        } else {
+          reason = 'unknown';
+        }
+        return '"${c.title}" by "${c.artist}" '
+            '(raw=$rawScore reason=$reason)';
+      }).join(', ');
+      debugPrint('LastWaveAddon stage=match-miss title="$title" '
+          'artist="$artist" top=[$top]');
+    }
+    return scored.map((e) => e.track).toList();
+  }
+
+  /// Artist check with primary-artist retry plus title feature-credit
+  /// fallback: the catalog may bill "Dracula feat JENNIE" with
+  /// artist="Tame Impala" while the queue has artist="Tame Impala"
+  /// and the credit only in the title (or vice versa — artist="JENNIE"
+  /// with the credit only in the catalog title). Expanding both sides
+  /// with their title credits closes that gap; plain mismatches
+  /// (1nonly vs JENNIE) still fail.
+  static bool _artistOkFeatAware({
+    required String cTitle,
+    required String cArtist,
+    required String wantTitle,
+    required String wantArtist,
+  }) {
+    if (_artistOkWithPrimary(cArtist, wantArtist)) return true;
+    final cFeat = _featPart(cTitle);
+    final wFeat = _featPart(wantTitle);
+    final expC = cFeat.isNotEmpty ? '$cArtist $cFeat' : cArtist;
+    final expW = wFeat.isNotEmpty ? '$wantArtist $wFeat' : wantArtist;
+    if (_clean(expC) != _clean(cArtist) ||
+        _clean(expW) != _clean(wantArtist)) {
+      if (_artistOkWithPrimary(expC, expW)) return true;
+    }
+    return false;
+  }
+
+  /// Artist check with primary-artist retry: "The Weeknd; Daft Punk"
+  /// and "Tame Impala feat. JENNIE" both match the catalog primary.
+  static bool _artistOkWithPrimary(String candidate, String target) {
+    if (_artistOk(candidate, target)) return true;
+    final primary = primaryArtistForMatch(target);
+    if (primary.isNotEmpty && _clean(primary) != _clean(target)) {
+      if (_artistOk(candidate, primary)) return true;
+    }
+    final candidatePrimary = primaryArtistForMatch(candidate);
+    if (candidatePrimary.isNotEmpty &&
+        _clean(candidatePrimary) != _clean(candidate)) {
+      if (_artistOk(candidatePrimary, target)) return true;
+    }
+    return false;
   }
 
   static bool _artistOk(String candidate, String target) {
@@ -606,32 +870,92 @@ class AddonApi implements LosslessSource {
   }) async {
     final cleanT = _clean(title);
     final cleanA = _clean(artist);
+    // Three queries, highest solo-hit-rate first: six concurrent
+    // requests still shared the host throttle (~2.3s slowest), while
+    // the dropped permutations (primary-artist, stripped-only,
+    // title-only, title+album) almost never win the pooled ranking —
+    // bestMatches re-ranks the union anyway, so recall is preserved.
     final queries = {
       if (cleanA.isNotEmpty && cleanT.isNotEmpty) '$cleanA $cleanT',
       if (cleanA.isNotEmpty && cleanT.isNotEmpty) '$cleanT $cleanA',
-      if (cleanT.isNotEmpty) cleanT,
       '$title $artist',
-    }.where((q) => q.trim().isNotEmpty).take(4);
-    for (final q in queries) {
-      List<AddonTrack> items;
-      try {
-        items = await searchTracks(q);
-      } on AddonQuotaException {
-        rethrow;
-      } catch (_) {
-        continue;
+    }.where((q) => q.trim().isNotEmpty).take(3);
+    // Pool candidates across ALL queries, then rank once: per-query
+    // winners with stripped-only scoring re-introduce the exact bug
+    // being fixed (original beats remix). bestMatch already ranks by
+    // (title, feat fidelity, raw, album), so one call over the pool
+    // picks the right version and survives 30-item page burial.
+    final pool = <AddonTrack>[];
+    final seenIds = <String>{};
+    var queriesOk = 0;
+    // Search with the tier's primary knob (Android parity): entries
+    // tagged only for other tiers are server-filtered otherwise.
+    final searchQuality =
+        serverQualitiesForTier(preferredQuality).first;
+    final searchSw = Stopwatch()..start();
+    // Fan out all queries concurrently: sequential round-trips were the
+    // whole first-play delay (~4s of search). Results merge in query
+    // order so the ranking input is identical to the old sequential
+    // version; per-query failures still contribute nothing, and a quota
+    // rejection still aborts the resolve like before.
+    final queryList = queries.toList();
+    final searched = await Future.wait(
+      queryList.map((q) async {
+        try {
+          final items =
+              await searchTracks(q, limit: 30, quality: searchQuality);
+          return (true, items);
+        } on AddonQuotaException {
+          rethrow;
+        } catch (_) {
+          return (false, const <AddonTrack>[]);
+        }
+      }),
+    );
+    for (final (ok, items) in searched) {
+      if (!ok) continue;
+      queriesOk++;
+      for (final item in items) {
+        if (seenIds.add(item.id)) {
+          pool.add(item);
+        }
       }
-      final match = bestMatch(
-        items,
-        title: title,
-        artist: artist,
-        expectedDurationSeconds: expectedDurationSeconds,
-      );
-      if (match == null) continue;
-      for (final serverQuality
-          in serverQualitiesForTier(preferredQuality)) {
+    }
+    searchSw.stop();
+    final searchMs = searchSw.elapsedMilliseconds;
+    if (kDebugMode && pool.isEmpty) {
+      // No candidates at all: search failed/empty, not a gate reject
+      // (bestMatch stays silent on empty input by design).
+      debugPrint('LastWaveAddon stage=empty-pool title="$title" '
+          'artist="$artist" queriesOk=$queriesOk search_ms=$searchMs');
+      debugPrint('LastWave-Timing addon title="$title" '
+          'search_ms=$searchMs fetch_ms=0 result=empty-pool');
+      return null;
+    }
+    // Bound the worst case: each match fans out over qualities ×
+    // bases with 15s timeouts, so only the top few are worth trying
+    // before YouTube (which is instant from cache) wins on latency.
+    final matches = bestMatches(
+      pool,
+      title: title,
+      artist: artist,
+      album: album,
+      expectedDurationSeconds: expectedDurationSeconds,
+    ).take(3).toList();
+    if (matches.isEmpty) {
+      if (kDebugMode) {
+        debugPrint('LastWave-Timing addon title="$title" '
+            'search_ms=$searchMs fetch_ms=0 result=no-match');
+      }
+      return null;
+    }
+    var fetchAttempts = 0;
+    final fetchSw = Stopwatch()..start();
+    for (final match in matches) {
+      for (final serverQuality in serverQualitiesForTier(preferredQuality)) {
         for (final root in bases) {
           try {
+            fetchAttempts++;
             final stream = await _fetchTrack(
               root,
               match.id,
@@ -639,7 +963,15 @@ class AddonApi implements LosslessSource {
               title: title,
               artist: artist,
             );
-            if (stream != null) return stream;
+            if (stream != null) {
+              fetchSw.stop();
+              if (kDebugMode) {
+                debugPrint('LastWave-Timing addon title="$title" '
+                    'search_ms=$searchMs fetch_ms=${fetchSw.elapsedMilliseconds} '
+                    'attempts=$fetchAttempts result=hit');
+              }
+              return stream;
+            }
           } on AddonQuotaException {
             rethrow;
           } catch (_) {
@@ -647,7 +979,19 @@ class AddonApi implements LosslessSource {
           }
         }
       }
-      return null;
+      if (kDebugMode) {
+        // One entry's mint failed on every tier (e.g. HTTP 502 on a
+        // `swap_` composite) — the loop tries the next-best version
+        // rather than dropping straight to YouTube.
+        debugPrint('LastWaveAddon stage=fetch-fail id="${match.id}" '
+            'title="${match.title}" attempts=$fetchAttempts');
+      }
+    }
+    fetchSw.stop();
+    if (kDebugMode) {
+      debugPrint('LastWave-Timing addon title="$title" '
+          'search_ms=$searchMs fetch_ms=${fetchSw.elapsedMilliseconds} '
+          'attempts=$fetchAttempts result=miss');
     }
     return null;
   }

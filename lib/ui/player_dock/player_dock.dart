@@ -726,11 +726,19 @@ class _PlayGlyphState extends State<_PlayGlyph> {
         focusNode: _focus,
         onFocusChange: (_) => setState(() {}),
         onKeyEvent: (node, event) {
+          // Space is owned by the global shell handler (always toggles
+          // playback, even when this glyph has focus). Enter still
+          // activates the focused glyph natively.
           if (event is KeyDownEvent &&
+feat/keyboard-shortcuts
               (event.logicalKey == LogicalKeyboardKey.enter ||
                   event.logicalKey == LogicalKeyboardKey.space)) {
             if (!widget.enabled) return KeyEventResult.ignored;
             widget.onTap();
+            
+              event.logicalKey == LogicalKeyboardKey.enter) {
+            if (widget.enabled) widget.onTap();
+                main
             return KeyEventResult.handled;
           }
           return KeyEventResult.ignored;

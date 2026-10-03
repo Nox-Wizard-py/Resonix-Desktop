@@ -13,6 +13,7 @@
 
 namespace lastwave {
 class WasapiChannel;
+class SmtcChannel;
 }
 
 // A window that does nothing but host a Flutter view.
@@ -36,7 +37,11 @@ class FlutterWindow : public Win32Window {
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
   std::unique_ptr<lastwave::WasapiChannel> wasapi_channel_;
+ feat/keyboard-shortcuts
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> media_channel_;
+
+  std::unique_ptr<lastwave::SmtcChannel> smtc_channel_;
+ main
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

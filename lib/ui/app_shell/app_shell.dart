@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../../app/window.dart';
 import '../../core/audio/stream_models.dart';
@@ -25,6 +26,7 @@ import '../queue/queue_panel.dart';
 import '../theme/tokens.dart';
 import 'command_palette.dart';
 import 'title_bar.dart';
+import 'wave_hotkeys.dart';
 
 /// Rebuilt desktop shell — THIS IS A MUSIC PLAYER.
 ///
@@ -180,6 +182,7 @@ class _WaveShellState extends ConsumerState<WaveShell> {
   void initState() {
     super.initState();
     _searchController = TextEditingController();
+    feat/keyboard-shortcuts
     // Restore shell focus after any navigation or panel change so that
     // the Shortcuts ancestor always sits in the active focus chain.
     // Only reclaims if nothing else inside the shell has primary focus
@@ -197,6 +200,142 @@ class _WaveShellState extends ConsumerState<WaveShell> {
         case 'previous':
           ref.read(playbackServiceProvider.notifier).previous();
           break;
+          
+    // Global hotkeys → playback. Re-registers the window.dart bindings
+    // with Riverpod-aware handlers (HotKeyManager stores per-identifier
+    // handlers, so re-register overwrites the no-op placeholders).
+    _wireHotkeys();
+    // Truly global in-app shortcuts: HardwareKeyboard fires before focus
+    // dispatch, so Space/arrows can't be eaten by the focused button or
+    // list (see wave_hotkeys.dart).
+    HardwareKeyboard.instance.addHandler(_onGlobalKey);
+  }
+
+  /// OS-level hotkeys are background-only: the in-app global handler (§
+  /// _onGlobalKey) already toggles while the window is focused, so the OS
+  /// handler must stand down then or every press would fire twice.
+  Future<bool> _windowFocused() async {
+    try {
+      return await windowManager.isFocused();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _onGlobalKey(KeyEvent event) {
+    if (!mounted) return false;
+    return handleWaveHotkey(
+      event,
+      WaveHotkeyActions(
+        isTyping: () => waveIsTypingFocused(_searchFocus),
+        hasTrack: () =>
+            ref.read(playbackServiceProvider).current != null,
+        togglePlay: () {
+          if (mounted) ref.read(playbackServiceProvider.notifier).toggle();
+        },
+        next: () {
+          if (mounted) ref.read(playbackServiceProvider.notifier).next();
+        },
+        previous: () {
+          if (mounted) ref.read(playbackServiceProvider.notifier).previous();
+        },
+        openPalette: () {
+          if (mounted) _openPalette();
+        },
+        focusSearch: () => _searchFocus.requestFocus(),
+        toggleLyrics: () {
+          if (!mounted) return;
+          setState(() {
+            _lyricsOpen = !_lyricsOpen;
+            if (_lyricsOpen) _queueOpen = false;
+          });
+        },
+        goBack: () {
+          if (mounted) _goBack();
+        },
+        goForward: () {
+          if (mounted) _goForward();
+        },
+        handleEscape: () {
+          if (!mounted) return false;
+          return _handleEscape();
+        },
+        seekBySeconds: _seekBySeconds,
+        volumeByDelta: _volumeByDelta,
+      ),
+    );
+  }
+
+  /// Esc priority chain. Returns true when something was closed/unfocused.
+  bool _handleEscape() {
+    if (_searchFocus.hasFocus) {
+      _searchFocus.unfocus();
+      return true;
+    } else if (_lyricsOpen) {
+      setState(() => _lyricsOpen = false);
+      return true;
+    } else if (_queueOpen) {
+      setState(() => _queueOpen = false);
+      return true;
+    } else if (_miniOpen) {
+      setState(() => _miniOpen = false);
+      return true;
+    } else if (_lastCollapsed == false) {
+      // Overlay rail light-dismisses via keyboard too.
+      setState(() => _railExpanded = false);
+      return true;
+    } else if (_lastIsNowPlaying) {
+      if (context.canPop()) {
+        context.pop();
+      } else {
+        context.go('/home');
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void _seekBySeconds(int delta) {
+    if (!mounted) return;
+    final snap = ref.read(playbackServiceProvider);
+    if (snap.current == null) return;
+    final target = snap.position + Duration(seconds: delta);
+    final clamped = target.isNegative
+        ? Duration.zero
+        : (target > snap.duration ? snap.duration : target);
+    ref.read(playbackServiceProvider.notifier).seek(clamped);
+  }
+
+  void _volumeByDelta(double delta) {
+    if (!mounted) return;
+    final snap = ref.read(playbackServiceProvider);
+    if (snap.current == null) return;
+    final v = (snap.volume + delta).clamp(0.0, 1.0);
+    ref.read(playbackServiceProvider.notifier).setVolume(v);
+  }
+
+  Future<void> _wireHotkeys() async {
+    // No global backend on Wayland — the in-app global handler covers
+    // these combos while the window is focused instead.
+    if (!globalHotkeysSupported) return;
+    try {
+      Future<void> toggle(HotKey _) async {
+        if (!mounted) return;
+        if (await _windowFocused()) return;
+        await ref.read(playbackServiceProvider.notifier).toggle();
+      }
+
+      Future<void> next(HotKey _) async {
+        if (!mounted) return;
+        if (await _windowFocused()) return;
+        await ref.read(playbackServiceProvider.notifier).next();
+      }
+
+      Future<void> prev(HotKey _) async {
+        if (!mounted) return;
+        if (await _windowFocused()) return;
+        await ref.read(playbackServiceProvider.notifier).previous();
+        main
       }
     });
   }
@@ -231,9 +370,13 @@ class _WaveShellState extends ConsumerState<WaveShell> {
 
   @override
   void dispose() {
+feat/keyboard-shortcuts
     _mediaChannel.setMethodCallHandler(null);
     _shellFocus.removeListener(_reclaimFocusIfOrphaned);
     _shellFocus.dispose();
+
+    HardwareKeyboard.instance.removeHandler(_onGlobalKey);
+main
     _searchController.dispose();
     _searchFocus.dispose();
     super.dispose();
@@ -354,6 +497,7 @@ class _WaveShellState extends ConsumerState<WaveShell> {
     );
   }
 
+ feat/keyboard-shortcuts
   void _togglePlay() {
     ref.read(playbackServiceProvider.notifier).toggle();
   }
@@ -371,6 +515,13 @@ class _WaveShellState extends ConsumerState<WaveShell> {
     if (debugLabel != null && debugLabel.contains('EditableText')) return true;
     return false;
   }
+
+  /// Latest layout/route snapshot for the focus-independent Esc chain
+  /// (the global key handler outlives individual builds, so it reads
+  /// these fields instead of capturing stale build locals).
+  bool _lastCollapsed = true;
+  bool _lastIsNowPlaying = false;
+ main
 
   Future<void> _dropFiles(List<String> paths) async {
     final tracks = <PlayableTrack>[];
@@ -422,6 +573,7 @@ class _WaveShellState extends ConsumerState<WaveShell> {
     final isLyrics = routePath.startsWith('/lyrics');
     final isNowPlaying = routePath.startsWith('/now');
 
+ feat/keyboard-shortcuts
     return Shortcuts(
       shortcuts: {
         AppShortcuts.activator(AppShortcut.playPause): const PlayPauseIntent(),
@@ -589,6 +741,20 @@ class _WaveShellState extends ConsumerState<WaveShell> {
             focusNode: _shellFocus,
             autofocus: true,
             child: Mica(
+
+    // Snapshot for the focus-independent Esc chain (the global
+    // HardwareKeyboard handler reads these fields).
+    _lastCollapsed = collapsed;
+    _lastIsNowPlaying = isNowPlaying;
+
+    // NOTE: no CallbackShortcuts / Focus(onKeyEvent) wrapper here on
+    // purpose. Those only fire via focus-bubbling, so focused buttons and
+    // lists ate Space/arrows before the shell saw them. All app-wide keys
+    // live in the HardwareKeyboard handler (see initState/_onGlobalKey +
+    // wave_hotkeys.dart), which runs before focus dispatch and works from
+    // anywhere. Enter is deliberately left to focused controls.
+    return Mica(
+ main
           backgroundColor:
               dark ? WaveColors.background : WaveColors.lightBackground,
           child: Column(
@@ -816,6 +982,7 @@ class _WaveShellState extends ConsumerState<WaveShell> {
               ],
             ),
           ),
+ feat/keyboard-shortcuts
         ),
       ),
     ),
@@ -844,5 +1011,8 @@ class _WaveAction<T extends Intent> extends Action<T> {
   Object? invoke(covariant T intent) {
     onInvokeCallback();
     return null;
+
+        );
+ main
   }
 }
